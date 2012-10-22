@@ -1,0 +1,411 @@
+#!/usr/bin/env ruby
+#encoding: utf-8
+require 'json'
+
+class String
+  def number?
+    true if Float(self) rescue false
+  end
+end
+
+class Time
+  def self.minutes(minutes)
+    minutes * 60
+  end
+
+  def self.hours(hours)
+    hours * minutes(60)
+  end
+
+  def self.days(days)
+    days * hours(24)
+  end
+end
+
+class CLI
+  attr_reader :config_file_path
+
+  def initialize
+    @argv = ARGV.clone
+    if @argv.first == '--config'
+      @config_file_path = @argv[1]
+      unless File.exist?(@config_file_path)
+        raise TimeTracker::Error.new("Specified config file `#{@config_file_path}` does not exist!")
+      end
+      @argv.shift(2)
+    end
+  end
+
+  def help
+    puts "Usage:"
+    puts "t [(i)n|(o)ut|(e)dit|(d)isplay]|(r)remove|(c)ontinue [time/id] [message]"
+    puts ""
+    puts "Time syntax:"
+    puts "[+][2d][1h][2m]  | 2 days, 1 hour and 2 minutes ago"
+    puts ""
+    puts "If you prefix a time with + it is interpreted as a time in the future."
+    puts "The current time will be used if you do not specify a timestamp."
+    puts ""
+    puts "Examples:"
+    puts "t i 1h                  | Start time tracking an hour ago"
+    puts "t o +1h20m              | Stop time tracking in 1 hour and 20 minutes"
+    puts "t i \"Bug #123\"          | Starts time tracking now with the message \"Bug #123\""
+    puts "t days                  | Shows the current entries"
+    puts "t e \"Bug #123\"          | Sets the message of the last entry to \"Bug #123\""
+    puts "t e 456 \"Bug #123\"      | Sets the message of entry 456 to \"Bug #123\""
+    puts "t e 456 2h30m\"Bug #123\" | Sets the time and message of entry 456"
+    puts "t r 456                 | Removes the entry 456"
+    puts "t c                     | Starts a new entry with the same message as the last"
+    puts
+  end
+
+  def command
+    case @argv.first
+    when 'continue', 'c'
+      :continue
+    when 'display', 'd'
+      :display
+    when 'edit', 'e'
+      :edit
+    when 'in', 'i'
+      :in
+    when 'out', 'o'
+      :out
+    when 'remove', 'r'
+      :remove
+    else
+      nil
+    end
+  end
+
+  def arguments
+    @argv[1..2]
+  end
+
+  def timestamp
+    case arguments.length
+    when 0
+      Time.now
+    when 1
+      parse_timestamp(arguments.first) || Time.now
+    when 2
+      help and exit unless time = parse_timestamp(arguments.first)
+      time
+    else
+      help and exit
+    end
+  end
+
+  def message
+    case arguments.length
+    when 1
+      parse_timestamp(arguments.first) ? nil : arguments.first
+    when 2
+      arguments.last
+    else
+      nil
+    end
+  end
+
+  def id
+    arguments.first && arguments.first.number? ? arguments.first.to_i : nil
+  end
+
+  protected
+  def parse_timestamp(timestamp)
+    return nil unless match = timestamp.match(/^(\+|)(((\d+)d)|)(((\d+)h)|)(((\d+)m)|)$/)
+    prefix  = match.captures.first
+    days    = match.captures[3].to_i
+    hours   = match.captures[6].to_i
+    minutes = match.captures[9].to_i
+
+    offset = Time.days(days) + Time.hours(hours) + Time.minutes(minutes)
+    now    = Time.now
+
+    prefix == '+' ? now + offset : now - offset
+  end
+end
+
+class CLIUtils
+  def self.colorize(text, color_code)
+    "\e[#{color_code}m#{text}\e[0m"
+  end
+
+  def self.red(text); colorize(text, 31); end
+  def self.green(text); colorize(text, 32); end
+  def self.blue(text); colorize(text, 34); end
+  def self.blink(text)
+    "\e[5m#{text}\e[25m"
+  end
+end
+
+class Entry
+  attr_reader :start, :end, :message
+  def initialize(entry)
+    @start    = parse_time(entry['start'])
+    @end      = parse_time(entry['end'])
+    @message  = entry['message']
+  end
+
+  def days
+    data[:days]
+  end
+
+  def hours
+    data[:hours]
+  end
+
+  def minutes
+    data[:minutes]
+  end
+
+  def running?
+    data[:running]
+  end
+
+  protected
+  def data
+    unless @data
+      days, hours, minutes, running = days_hours_minutes_running
+      @data = {days: days, hours: hours, minutes: minutes, running: running}
+    end
+    @data
+  end
+
+  def days_hours_minutes_running
+    running = !@end
+    end_time = @end || Time.now
+    days_hours_minutes = end_time - @start
+
+    days = days_hours_minutes.div(Time.days(1))
+    days_hours_minutes -= Time.days(days)
+    hours = days_hours_minutes.div(Time.hours(1))
+    days_hours_minutes -= Time.hours(hours)
+    minutes = days_hours_minutes.div(Time.minutes(1))
+
+    [days, hours, minutes, running]
+  end
+
+  def parse_time(time)
+    return unless time
+    Time.at(time)
+  end
+end
+
+class Configuration
+  def self.load(custom_config_file_path)
+    config = {'data_file' => File.expand_path('./.time_tracker/times.json', '~')}
+
+    user_config_path = File.expand_path('./.time_tracker/config.json', '~')
+    user_config = {}
+    user_config = JSON.parse(File.read(user_config_path)) if File.exist?(user_config_path)
+
+    local_config_path = File.expand_path('./.time_tracker/config.json', Dir.pwd)
+    local_config = {}
+    local_config = JSON.parse(File.read(local_config_path)) if File.exist?(local_config_path)
+
+    custom_config = {}
+    custom_config = JSON.parse(File.read(custom_config_file_path)) if custom_config_file_path
+
+    config.merge(user_config).merge(local_config).merge(custom_config)
+  end
+end
+
+class Timesheet
+  def initialize(config)
+    @config = config
+    @times = load_times
+  end
+
+  def [](id)
+    @times[id]
+  end
+
+  def last_entry
+    @times.last
+  end
+
+  def current_entry
+    return if entry_done?(last_entry)
+    last_entry
+  end
+
+  def add(time, message)
+    @times << {'start' => time, 'message' => message}
+  end
+
+  def remove(id)
+    @times.delete_at(id)
+  end
+
+  def remove_last
+    @times.delete_at(@times.size - 1)
+  end
+
+  def save
+    save_times(@times)
+  end
+
+  def times
+    @times
+  end
+
+  def data_file
+    @config['data_file']
+  end
+
+  protected
+
+  def write_to_data_store(filename, times)
+    File.open(filename, 'w') do |f|
+      f.write JSON.dump(times)
+    end
+  end
+
+  def entry_done?(entry)
+    return true unless entry
+    entry['end']
+  end
+
+  def data_store_filename
+    dir = File.dirname(data_file)
+    raise TimeTracker::Error.new("#{dir} already exists but is not a directory") if File.exist?(dir) && !File.directory?(dir)
+    Dir::mkdir(dir) unless File.exist?(dir)
+
+    write_to_data_store(data_file, []) unless File.exist?(data_file)
+    data_file
+  end
+
+  def load_times
+    filename = data_store_filename
+    JSON.parse(File.read(filename))
+  end
+
+  def save_times(times)
+    write_to_data_store(data_store_filename, times.map {|time|
+      time['start'] = time['start'].to_i if time['start']
+      time['end']   = time['end'].to_i if time['end']
+      time
+    })
+  end
+end
+
+
+class TimeTracker
+  class Error < ::StandardError
+  end
+
+  def initialize(config)
+    @config = config
+  end
+
+  def in(time, message)
+    sheet = Timesheet.new(@config)
+    raise Error.new("Time tracking already running!") if sheet.current_entry
+    sheet.add(time, message)
+    sheet.save
+  end
+
+  def continue(time, message)
+    sheet = Timesheet.new(@config)
+    self.in(time, message || (sheet.last_entry && sheet.last_entry['message']) || nil)
+  end
+
+  def out(time, message)
+    sheet = Timesheet.new(@config)
+    current_entry = sheet.current_entry
+    raise Error.new("Time tracking not running!") unless current_entry
+    current_entry['end'] = time
+    current_entry['message'] = message if message
+    sheet.save
+  end
+
+  def edit(id, message)
+    sheet = Timesheet.new(@config)
+    entry = id ? sheet[id] : sheet.last_entry
+    raise Error.new("Entry #{id} not found!") unless entry
+    entry['message'] = message
+    sheet.save
+  end
+
+  def remove(id)
+    sheet = Timesheet.new(@config)
+    id ? sheet.remove(id) : sheet.remove_last
+    sheet.save
+  end
+
+  def display
+    sheet = Timesheet.new(@config)
+    last_date = nil
+    output = "Times from: #{sheet.data_file}:\n"
+
+    id = 0
+    sheet.times.each do |entry|
+      entry = Entry.new(entry)
+      date = format_date(entry.start)
+      if date != last_date
+        output << "\n#{date}:\n"
+        last_date = date
+      end
+      output << format_entry(id, entry) << "\n"
+      id += 1
+    end
+
+    output
+  end
+
+  protected
+  def format_date(date)
+    date.strftime("%d. %m. %Y")
+  end
+
+  def format_entry(id, entry)
+    "#%-3d %11s %s" % [id, format_entry_duration(entry), entry.message || "[No note]"]
+  end
+
+  def format_entry_duration(entry)
+    output = ""
+
+    output << ((entry.days > 0) ? ("%2dd" % entry.days) : (' ' * 3))
+    output << "%2dh " % entry.hours
+    output << "%02dm" % entry.minutes
+    output << (entry.running? ? CLIUtils.blink("⌚") : " ")
+  end
+end
+
+begin
+  cli = CLI.new
+  config = Configuration.load(cli.config_file_path)
+  time_tracker = TimeTracker.new(config)
+
+  case cli.command
+  when :continue
+    time_tracker.continue(cli.timestamp, cli.message)
+    puts time_tracker.display
+    puts CLIUtils.green("Checked in")
+  when :display
+    puts time_tracker.display
+  when :edit
+    time_tracker.edit(cli.id, cli.message)
+    puts time_tracker.display
+    puts CLIUtils.green("Entry changed")
+  when :in
+    time_tracker.in(cli.timestamp, cli.message)
+    puts time_tracker.display
+    puts CLIUtils.green("Checked in")
+  when :out
+    time_tracker.out(cli.timestamp, cli.message)
+    puts time_tracker.display
+    puts CLIUtils.blue("Checked out")
+  when :remove
+    time_tracker.remove(cli.id)
+    puts time_tracker.display
+    puts CLIUtils.green("Entry removed")
+  else
+    cli.help
+  end
+rescue TimeTracker::Error => e
+  puts time_tracker.display
+  puts CLIUtils.red(e.message)
+  exit 1
+end
